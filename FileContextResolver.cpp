@@ -1,0 +1,104 @@
+#include "FileContextResolver.h"
+#include "LanguageDetector.h"
+#include <QRegularExpression>
+#include <QRegularExpressionMatchIterator>
+#include <QDebug>
+
+FileContextResolver::FileContextResolver(SymbolDatabase *symbolDb, CallGraph *callGraph,
+                                         DependencyGraph *depGraph, Retriever *retriever,
+                                         CodeParser *parser, QObject *parent)
+    : QObject(parent),
+      m_symbolDb(symbolDb),
+      m_callGraph(callGraph),
+      m_depGraph(depGraph),
+      m_retriever(retriever),
+      m_parser(parser)
+{
+}
+
+FileContextResolver::ResolutionResult FileContextResolver::resolve(const QString &query, const QString &currentFile)
+{
+    ResolutionResult result;
+
+    result.affectedFiles = findAffectedFiles(query, currentFile);
+    result.relevantSymbols = findAffectedSymbols(query);
+    result.executionPath = traceExecutionPath(query);
+    result.relatedDependencies = gatherDependencies(result.affectedFiles);
+
+    result.projectContext = QString("Query: %1\n").arg(query);
+    result.projectContext += QString("Current file: %1\n").arg(currentFile);
+    result.projectContext += QString("Affected files (%1):\n").arg(result.affectedFiles.size());
+    for (const QString &f : result.affectedFiles)
+        result.projectContext += "  - " + f + "\n";
+
+    result.projectContext += QString("Relevant symbols (%1):\n").arg(result.relevantSymbols.size());
+    for (const QString &s : result.relevantSymbols)
+        result.projectContext += "  - " + s + "\n";
+
+    emit resolutionComplete(result);
+    return result;
+}
+
+QStringList FileContextResolver::findAffectedFiles(const QString &query, const QString &currentFile)
+{
+    QStringList files;
+    if (!currentFile.isEmpty())
+        files.append(currentFile);
+
+    QRegularExpression fileRe(R"(\b[\w/\\]+\.(cpp|h|hpp|py|java|js|ts|rs|go|cs)\b)");
+    int start = 0;
+    QRegularExpressionMatch match;
+    while ((start = query.indexOf(fileRe, start, &match)) != -1) {
+        files.append(match.captured(0));
+        start += match.capturedLength();
+    }
+
+    files.removeDuplicates();
+    return files;
+}
+
+QStringList FileContextResolver::findAffectedSymbols(const QString &query)
+{
+    QStringList symbols;
+    if (!m_symbolDb)
+        return symbols;
+
+    QList<SymbolDatabase::SymbolRecord> records = m_symbolDb->searchSymbols(query);
+    for (const SymbolDatabase::SymbolRecord &rec : records)
+        symbols.append(QString("%1::%2").arg(rec.className, rec.symbolName));
+
+    symbols.removeDuplicates();
+    return symbols;
+}
+
+QStringList FileContextResolver::traceExecutionPath(const QString &query)
+{
+    QStringList path;
+    if (!m_callGraph)
+        return path;
+
+    QRegularExpression funcRe(R"((\w+)::(\w+))");
+    auto match = funcRe.match(query);
+    if (match.hasMatch()) {
+        QString func = match.captured(0);
+        path = m_callGraph->getExecutionPath(func, func, 5);
+    }
+    return path;
+}
+
+QStringList FileContextResolver::gatherDependencies(const QStringList &files)
+{
+    QStringList deps;
+    if (!m_depGraph)
+        return deps;
+
+    for (const QString &file : files) {
+        QList<DependencyGraph::Dependency> fileDeps = m_depGraph->getDependencies(file);
+        for (const DependencyGraph::Dependency &dep : fileDeps) {
+            if (!dep.to.isEmpty())
+                deps.append(dep.to);
+        }
+    }
+    deps.removeDuplicates();
+    return deps;
+}
