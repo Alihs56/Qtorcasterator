@@ -63,7 +63,7 @@ bool SymbolDatabase::isReady() const
 
 bool SymbolDatabase::removeFile(const QString &filePath)
 {
-    QMutexLocker locker(&m_mutex);
+    // NOTE: Caller must hold m_mutex lock
     if (!ensureConnection()) return false;
 
     QSqlQuery query(m_db);
@@ -105,31 +105,38 @@ bool SymbolDatabase::createTables()
         return false;
     }
 
-    sql = R"(
-        CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(symbol_name);
-        CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_path);
-        CREATE INDEX IF NOT EXISTS idx_symbols_type ON symbols(symbol_type);
-        CREATE INDEX IF NOT EXISTS idx_symbols_lang ON symbols(language);
-    )";
+    // FIXED: Execute each CREATE INDEX separately
+    QStringList indexQueries = {
+        "CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(symbol_name)",
+        "CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_path)",
+        "CREATE INDEX IF NOT EXISTS idx_symbols_type ON symbols(symbol_type)",
+        "CREATE INDEX IF NOT EXISTS idx_symbols_lang ON symbols(language)"
+    };
 
-    if (!query.exec(sql)) {
-        emit dbError(query.lastError().text());
-        return false;
+    for (const QString &indexSql : indexQueries) {
+        if (!query.exec(indexSql)) {
+            emit dbError("Failed to create index: " + query.lastError().text());
+            return false;
+        }
     }
 
     return true;
 }
 
-// بازنویسی با استفاده از تراکنش (Transaction) برای سرعت انفجاری
+// FIXED: Removed recursive lock, caller must hold mutex
 int SymbolDatabase::indexFile(const QString &filePath, const QList<SymbolInfo> &symbols, const QString &fileHash) {
     QMutexLocker locker(&m_mutex);
     if (!ensureConnection()) return -1;
 
-    // شروع تراکنش: تمام عملیات‌ها در حافظه موقت انجام شده و یکباره روی هارد نوشته می‌شوند
+    // Start transaction: all operations buffered, then written atomically
     m_db.transaction(); 
 
     try {
-        removeFile(filePath); // حذف اطلاعات قدیمی فایل
+        // FIXED: Call removeFile without acquiring lock again
+        if (!removeFile(filePath)) {
+            m_db.rollback();
+            return -1;
+        }
 
         QSqlQuery query(m_db);
         query.prepare(R"(
@@ -147,18 +154,26 @@ int SymbolDatabase::indexFile(const QString &filePath, const QList<SymbolInfo> &
             query.addBindValue(sym.endLine);
             
             if (query.exec()) count++;
+            else {
+                emit dbError("Insert failed: " + query.lastError().text());
+                m_db.rollback();
+                return -1;
+            }
+            
+            query.clear();
         }
 
-        m_db.commit(); // پایان تراکنش و نوشتن روی هارد
+        m_db.commit();
         return count;
     } catch (...) {
-        m_db.rollback(); // در صورت خطا، دیتابیس به حالت قبل برمی‌گرده و خراب نمیشه
+        m_db.rollback();
         return -1;
     }
 }
 
 int SymbolDatabase::indexSymbol(const SymbolRecord &record)
 {
+    QMutexLocker locker(&m_mutex);
     if (!ensureConnection()) return -1;
 
     QSqlQuery query(m_db);
@@ -195,9 +210,9 @@ int SymbolDatabase::indexSymbol(const SymbolRecord &record)
     return id;
 }
 
-// بازنویسی برای مدیریت امن دیتابیس در محیط چندرشته‌ای (Thread-Safe DB)
+// FIXED: Added proper mutex handling for thread-safe database connections
 bool SymbolDatabase::ensureConnection() {
-    // ایجاد نام اتصال منحصربه‌فرد برای هر رشته (Thread)
+    // Create unique connection name per thread
     QString connectionName = QString("conn_%1").arg(quintptr(QThread::currentThreadId()));
 
     if (QSqlDatabase::contains(connectionName)) {
@@ -212,9 +227,9 @@ bool SymbolDatabase::ensureConnection() {
             emit dbError("Database thread connection failed: " + m_db.lastError().text());
             return false;
         }
-        // اگر اتصال جدید است، ایندکس‌ها و تنظیمات پرفورمنس را اعمال کن
+        // Apply performance pragmas for new connections
         QSqlQuery q(m_db);
-        q.exec("PRAGMA journal_mode = WAL;"); // افزایش سرعت نوشتن همزمان
+        q.exec("PRAGMA journal_mode = WAL;");
         q.exec("PRAGMA synchronous = NORMAL;");
     }
     return true;
@@ -286,8 +301,10 @@ QList<SymbolDatabase::SymbolRecord> SymbolDatabase::searchByType(SymbolInfo::Typ
     QSqlQuery query(m_db);
     query.prepare("SELECT * FROM symbols WHERE symbol_type = ?");
     query.addBindValue(static_cast<int>(type));
-    while (query.next())
-        results.append(queryToRecord(query));
+    if (query.exec()) {
+        while (query.next())
+            results.append(queryToRecord(query));
+    }
     return results;
 }
 
@@ -300,8 +317,10 @@ QList<SymbolDatabase::SymbolRecord> SymbolDatabase::searchByFile(const QString &
     QSqlQuery query(m_db);
     query.prepare("SELECT * FROM symbols WHERE file_path = ?");
     query.addBindValue(filePath);
-    while (query.next())
-        results.append(queryToRecord(query));
+    if (query.exec()) {
+        while (query.next())
+            results.append(queryToRecord(query));
+    }
     return results;
 }
 
@@ -314,8 +333,10 @@ QList<SymbolDatabase::SymbolRecord> SymbolDatabase::searchByLanguage(LanguageDet
     QSqlQuery query(m_db);
     query.prepare("SELECT * FROM symbols WHERE language = ?");
     query.addBindValue(static_cast<int>(lang));
-    while (query.next())
-        results.append(queryToRecord(query));
+    if (query.exec()) {
+        while (query.next())
+            results.append(queryToRecord(query));
+    }
     return results;
 }
 
@@ -328,8 +349,10 @@ QList<SymbolDatabase::SymbolRecord> SymbolDatabase::searchByNamePrefix(const QSt
     QSqlQuery query(m_db);
     query.prepare("SELECT * FROM symbols WHERE symbol_name LIKE ? LIMIT 30");
     query.addBindValue(prefix + "%");
-    while (query.next())
-        results.append(queryToRecord(query));
+    if (query.exec()) {
+        while (query.next())
+            results.append(queryToRecord(query));
+    }
     return results;
 }
 
@@ -342,8 +365,10 @@ QList<SymbolDatabase::SymbolRecord> SymbolDatabase::getDefinitions(const QString
     QSqlQuery query(m_db);
     query.prepare("SELECT * FROM symbols WHERE symbol_name = ? AND symbol_type IN (1,2,3,4,5)");
     query.addBindValue(name);
-    while (query.next())
-        results.append(queryToRecord(query));
+    if (query.exec()) {
+        while (query.next())
+            results.append(queryToRecord(query));
+    }
     return results;
 }
 
@@ -356,8 +381,10 @@ QList<SymbolDatabase::SymbolRecord> SymbolDatabase::getDeclarations(const QStrin
     QSqlQuery query(m_db);
     query.prepare("SELECT * FROM symbols WHERE symbol_name = ? AND symbol_type = 5");
     query.addBindValue(name);
-    while (query.next())
-        results.append(queryToRecord(query));
+    if (query.exec()) {
+        while (query.next())
+            results.append(queryToRecord(query));
+    }
     return results;
 }
 
@@ -371,8 +398,10 @@ QList<SymbolDatabase::SymbolRecord> SymbolDatabase::getReferences(const QString 
     query.prepare("SELECT * FROM symbols WHERE function_signature LIKE ? OR documentation LIKE ?");
     query.addBindValue("%" + name + "%");
     query.addBindValue("%" + name + "%");
-    while (query.next())
-        results.append(queryToRecord(query));
+    if (query.exec()) {
+        while (query.next())
+            results.append(queryToRecord(query));
+    }
     return results;
 }
 
@@ -385,8 +414,10 @@ QList<SymbolDatabase::SymbolRecord> SymbolDatabase::suggest(const QString &parti
     QSqlQuery query(m_db);
     query.prepare("SELECT * FROM symbols WHERE symbol_name LIKE ? LIMIT 10");
     query.addBindValue(partial + "%");
-    while (query.next())
-        results.append(queryToRecord(query));
+    if (query.exec()) {
+        while (query.next())
+            results.append(queryToRecord(query));
+    }
     return results;
 }
 
@@ -394,9 +425,10 @@ int SymbolDatabase::totalSymbols() const
 {
     QMutexLocker locker(&m_mutex);
     QSqlQuery query(m_db);
-    query.exec("SELECT COUNT(*) FROM symbols");
-    if (query.next())
-        return query.value(0).toInt();
+    if (query.exec("SELECT COUNT(*) FROM symbols")) {
+        if (query.next())
+            return query.value(0).toInt();
+    }
     return 0;
 }
 
@@ -404,9 +436,10 @@ int SymbolDatabase::totalFiles() const
 {
     QMutexLocker locker(&m_mutex);
     QSqlQuery query(m_db);
-    query.exec("SELECT COUNT(DISTINCT file_path) FROM symbols");
-    if (query.next())
-        return query.value(0).toInt();
+    if (query.exec("SELECT COUNT(DISTINCT file_path) FROM symbols")) {
+        if (query.next())
+            return query.value(0).toInt();
+    }
     return 0;
 }
 
