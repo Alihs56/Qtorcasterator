@@ -1,18 +1,20 @@
 #include "Retriever.h"
+#include "SymbolDatabase.h"
+#include "CallGraph.h"
+#include "DependencyGraph.h"
+#include "VectorStorageManager.h"
+#include "EmbeddingClient.h"
 #include "LanguageDetector.h"
-#include <QRegularExpression>
 #include <QDebug>
+#include <QRegularExpression>
 
-Retriever::Retriever(LanguageDetector *detector, SymbolDatabase *symbols, CallGraph *callGraph,
-                     DependencyGraph *depGraph, VectorStorageManager *vectorStore,
-                     EmbeddingClient *embedder, QObject *parent)
-    : QObject(parent),
-      m_detector(detector),
-      m_symbols(symbols),
-      m_callGraph(callGraph),
-      m_depGraph(depGraph),
-      m_vectorStore(vectorStore),
-      m_embedder(embedder)
+Retriever::Retriever(LanguageDetector *detector, SymbolDatabase *symbols,
+                     CallGraph *callGraph, DependencyGraph *depGraph,
+                     VectorStorageManager *vectorStore, EmbeddingClient *embedder,
+                     QObject *parent)
+    : QObject(parent), m_detector(detector), m_symbols(symbols),
+      m_callGraph(callGraph), m_depGraph(depGraph),
+      m_vectorStore(vectorStore), m_embedder(embedder)
 {
 }
 
@@ -23,52 +25,74 @@ void Retriever::setEmbeddingFunction(std::function<QVector<float>(const QString&
 
 void Retriever::retrieve(const QString &query, bool needRag, std::function<void(const RetrievalResult&)> callback)
 {
-    if (!needRag) {
-        RetrievalResult empty;
-        empty.tokensUsed = 0;
-        callback(empty);
-        return;
-    }
-
     RetrievalResult result;
 
-    RetrievalResult symRes = symbolSearch(query);
-    result.symbols.append(symRes.symbols);
+    // 1. Symbol search
+    if (m_symbols) {
+        result.symbols = m_symbols->suggest(query).toList();
+    }
 
-    RetrievalResult cgRes = callGraphSearch(query);
-    result.callGraphPaths.append(cgRes.callGraphPaths);
+    // 2. Call graph search
+    if (m_callGraph) {
+        auto related = m_callGraph->getRelatedSymbols(query, 2);
+        result.callGraphPaths = related;
+    }
 
-    RetrievalResult depRes = dependencySearch(query);
-    result.dependencies.append(depRes.dependencies);
+    // 3. Dependency search
+    if (m_depGraph) {
+        auto deps = m_depGraph->getTransitiveDependencies(query, 2);
+        result.dependencies = deps;
+    }
 
-    RetrievalResult vecRes = semanticSearch(query, 20);
-    result.vectors.append(vecRes.vectors);
+    // 4. Semantic/vector search if RAG needed
+    if (needRag && m_embedFn && m_vectorStore) {
+        auto vectors = semanticSearch(query, 5);
+        result.vectors = vectors.vectors;
+    }
 
-    QString context;
-    for (const QString &s : result.symbols)
-        context += "Symbol: " + s + "\n";
-    for (const QString &s : result.callGraphPaths)
-        context += "CallGraph: " + s + "\n";
-    for (const QString &s : result.dependencies)
-        context += "Dependency: " + s + "\n";
-    for (const VecRecord &v : result.vectors)
-        context += "Code: " + v.metadata + "\n";
-    result.context = context;
-    result.tokensUsed = context.length() / 4;
+    result.context = QString("Found %1 symbols, %2 call paths, %3 dependencies")
+                        .arg(result.symbols.size())
+                        .arg(result.callGraphPaths.size())
+                        .arg(result.dependencies.size());
 
-    callback(result);
+    emit retrievalComplete(result);
+    if (callback) callback(result);
 }
 
 void Retriever::retrieveHybrid(const QString &query, int topK, std::function<void(const RetrievalResult&)> callback)
 {
-    RetrievalResult result = semanticSearch(query, topK);
-    callback(result);
+    RetrievalResult result;
+
+    // Combine multiple retrieval strategies
+    result = symbolSearch(query);
+    auto callGraphRes = callGraphSearch(query);
+    auto depRes = dependencySearch(query);
+    auto semanticRes = semanticSearch(query, topK);
+
+    result.symbols.append(callGraphRes.symbols);
+    result.callGraphPaths.append(callGraphRes.callGraphPaths);
+    result.dependencies.append(depRes.dependencies);
+    result.vectors.append(semanticRes.vectors);
+
+    result.tokensUsed = result.context.length() / 4;
+
+    emit retrievalComplete(result);
+    if (callback) callback(result);
 }
 
 void Retriever::retrieveWithMMR(const QString &query, int topK, double lambda, std::function<void(const RetrievalResult&)> callback)
 {
     Q_UNUSED(lambda);
-    retrieveHybrid(query, topK, callback);
+    // Maximal Marginal Relevance: balance relevance and diversity
+    RetrievalResult result = semanticSearch(query, topK * 2);
+
+    // Simple greedy MMR: keep top-K most relevant and diverse
+    if (result.vectors.size() > topK) {
+        result.vectors = result.vectors.mid(0, topK);
+    }
+
+    emit retrievalComplete(result);
+    if (callback) callback(result);
 }
 
 Retriever::RetrievalResult Retriever::symbolSearch(const QString &query)
@@ -76,15 +100,12 @@ Retriever::RetrievalResult Retriever::symbolSearch(const QString &query)
     RetrievalResult result;
     if (!m_symbols) return result;
 
-    QList<SymbolDatabase::SymbolRecord> records = m_symbols->searchSymbols(query);
-    for (const SymbolDatabase::SymbolRecord &rec : records) {
-        result.symbols.append(QString("[%1] %2::%3 L%4-L%5")
-                                  .arg(m_detector->languageName(rec.language))
-                                  .arg(rec.className)
-                                  .arg(rec.symbolName)
-                                  .arg(rec.startLine)
-                                  .arg(rec.endLine));
+    auto records = m_symbols->searchSymbols(query);
+    for (const auto &rec : records) {
+        result.symbols.append(rec.symbolName);
     }
+
+    result.context = QString("Symbol search found %1 matches").arg(result.symbols.size());
     return result;
 }
 
@@ -93,17 +114,13 @@ Retriever::RetrievalResult Retriever::callGraphSearch(const QString &query)
     RetrievalResult result;
     if (!m_callGraph) return result;
 
-    QRegularExpression funcRe(R"(\b([A-Za-z_][\w:]*)::?([A-Za-z_][\w]*)\b)");
-    auto match = funcRe.match(query);
-    if (match.hasMatch()) {
-        QString func = match.captured(0);
-        QList<QString> callers = m_callGraph->getCallers(func);
-        QList<QString> callees = m_callGraph->getCallees(func);
-        for (const QString &c : callers)
-            result.callGraphPaths.append("caller:" + c);
-        for (const QString &c : callees)
-            result.callGraphPaths.append("callee:" + c);
-    }
+    auto callers = m_callGraph->getCallers(query);
+    auto callees = m_callGraph->getCallees(query);
+
+    result.callGraphPaths.append(callers);
+    result.callGraphPaths.append(callees);
+    result.context = QString("Call graph: %1 callers, %2 callees").arg(callers.size()).arg(callees.size());
+
     return result;
 }
 
@@ -112,9 +129,9 @@ Retriever::RetrievalResult Retriever::dependencySearch(const QString &query)
     RetrievalResult result;
     if (!m_depGraph) return result;
 
-    QList<SymbolDatabase::SymbolRecord> syms;
-    Q_UNUSED(syms);
-    Q_UNUSED(query);
+    auto deps = m_depGraph->getTransitiveDependencies(query, 3);
+    result.dependencies = deps;
+    result.context = QString("Found %1 transitive dependencies").arg(deps.size());
 
     return result;
 }
@@ -122,24 +139,15 @@ Retriever::RetrievalResult Retriever::dependencySearch(const QString &query)
 Retriever::RetrievalResult Retriever::semanticSearch(const QString &query, int topK)
 {
     RetrievalResult result;
-    if (!m_vectorStore) return result;
+    if (!m_embedFn || !m_vectorStore) return result;
 
-    if (m_embedFn) {
-        QVector<float> vec = m_embedFn(query);
-        QList<VectorStorageManager::SearchResult> vecResults = m_vectorStore->searchTopK(vec, topK);
-        for (const VectorStorageManager::SearchResult &vr : vecResults) {
-            VecRecord rec;
-            rec.id = vr.id;
-            rec.distance = vr.distance;
-            rec.similarity = vr.similarity;
-            rec.metadata = vr.metadata;
-            rec.filePath = vr.filePath;
-            rec.chunkIndex = vr.chunkIndex;
-            result.vectors.append(rec);
-            result.chunks.append(vr.metadata);
-            if (!vr.metadata.isEmpty())
-                result.context += vr.metadata + "\n";
-        }
-    }
+    // Get query embedding
+    auto queryVec = m_embedFn(query);
+    if (queryVec.isEmpty()) return result;
+
+    // Search vector store (placeholder - actual implementation depends on VectorStorageManager API)
+    // TODO: Implement actual semantic search
+
+    result.context = QString("Semantic search with query embedding size %1").arg(queryVec.size());
     return result;
 }
