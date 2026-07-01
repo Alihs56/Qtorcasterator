@@ -1,18 +1,16 @@
 #include "FileContextResolver.h"
-#include "LanguageDetector.h"
+#include "SymbolDatabase.h"
+#include "CallGraph.h"
+#include "DependencyGraph.h"
+#include "CodeParser.h"
+#include "Retriever.h"
 #include <QRegularExpression>
-#include <QRegularExpressionMatchIterator>
-#include <QDebug>
 
 FileContextResolver::FileContextResolver(SymbolDatabase *symbolDb, CallGraph *callGraph,
-                                         DependencyGraph *depGraph, Retriever *retriever,
-                                         CodeParser *parser, QObject *parent)
-    : QObject(parent),
-      m_symbolDb(symbolDb),
-      m_callGraph(callGraph),
-      m_depGraph(depGraph),
-      m_retriever(retriever),
-      m_parser(parser)
+                                        DependencyGraph *depGraph, Retriever *retriever,
+                                        CodeParser *parser, QObject *parent)
+    : QObject(parent), m_symbolDb(symbolDb), m_callGraph(callGraph), m_depGraph(depGraph),
+      m_retriever(retriever), m_codeParser(parser)
 {
 }
 
@@ -73,15 +71,12 @@ QStringList FileContextResolver::findAffectedSymbols(const QString &query)
 
 QStringList FileContextResolver::traceExecutionPath(const QString &query)
 {
+    // Extract function names from query
     QStringList path;
-    if (!m_callGraph)
-        return path;
-
-    QRegularExpression funcRe(R"((\w+)::(\w+))");
+    QRegularExpression funcRe(R"(\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\()");
     auto match = funcRe.match(query);
     if (match.hasMatch()) {
-        QString func = match.captured(0);
-        path = m_callGraph->getExecutionPath(func, func, 5);
+        path.append(match.captured(1));
     }
     return path;
 }
@@ -89,16 +84,14 @@ QStringList FileContextResolver::traceExecutionPath(const QString &query)
 QStringList FileContextResolver::gatherDependencies(const QStringList &files)
 {
     QStringList deps;
-    if (!m_depGraph)
-        return deps;
-
     for (const QString &file : files) {
-        QList<DependencyGraph::Dependency> fileDeps = m_depGraph->getDependencies(file);
-        for (const DependencyGraph::Dependency &dep : fileDeps) {
-            if (!dep.to.isEmpty())
-                deps.append(dep.to);
+        if (m_depGraph) {
+            auto fileDeps = m_depGraph->getTransitiveDependencies(file, 2);
+            for (const QString &dep : fileDeps) {
+                if (!deps.contains(dep))
+                    deps.append(dep);
+            }
         }
     }
-    deps.removeDuplicates();
     return deps;
 }

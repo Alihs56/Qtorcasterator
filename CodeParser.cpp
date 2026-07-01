@@ -20,7 +20,7 @@ QList<SymbolInfo> CodeParser::parse(const QString &filePath)
     QString content = ts.readAll();
     file.close();
 
-    LanguageDetector::Language lang = m_detector->detect(filePath);
+    LanguageDetector::Language lang = m_detector ? m_detector->detect(filePath) : LanguageDetector::Cpp;
     return parseContent(content, filePath, lang);
 }
 
@@ -91,13 +91,9 @@ QList<SymbolInfo> CodeParser::parseCpp(const QString &content, const QString &fi
     QList<SymbolInfo> symbols;
     QStringList lines = content.split('\n');
 
-    QRegularExpression classRe(R"(\b(class|struct)\s+([A-Za-z_][\w:]*))");
-    QRegularExpression funcRe(R"((?:^|\n)\s*(?:inline\s+|static\s+|virtual\s+|const\s+|explicit\s+)*((?:[\w:~]+\s+)+)(\w+)\s*\(([^)]*)\)\s*(?:const)?\s*(?:->\s*([\w:<\s&*]+))?\s*\{?))");
-    QRegularExpression methodRe(R"((\w+)\s*::\s*~?\s*(\w+)\s*\(([^)]*)\)\s*(?:const)?)");
+    QRegularExpression classRe(R"(\b(class|struct)\s+([A-Za-z_][\w:]*))" );
     QRegularExpression nsRe(R"(\bnamespace\s+([\w:]+)\s*\{)");
-    QRegularExpression includeRe(R"(#include\s+[<"]([^>"]+)[>"])");
-    QRegularExpression docRe(R"(/\*\*[\s\S]*?\*/)");
-    QRegularExpression commentRe(R"(//\s*.*$|/\*[\s\S]*?\*/)");
+    QRegularExpression includeRe(R"(#include\s+[<\"]([^>\"]+)[>\"])");
 
     for (int i = 0; i < lines.size(); ++i) {
         const QString &line = lines.at(i);
@@ -110,7 +106,7 @@ QList<SymbolInfo> CodeParser::parseCpp(const QString &content, const QString &fi
             sym.name = mc.captured(2).trimmed();
             sym.qualifiedName = sym.name;
             sym.startLine = lineNum;
-            sym.endLine = findBlockEnd(lines, lineNum); 
+            sym.endLine = findBlockEnd(lines, lineNum);
             sym.filePath = filePath;
             sym.language = "cpp";
             symbols.append(sym);
@@ -123,7 +119,7 @@ QList<SymbolInfo> CodeParser::parseCpp(const QString &content, const QString &fi
             sym.name = nm.captured(1).trimmed();
             sym.qualifiedName = sym.name;
             sym.startLine = lineNum;
-            sym.endLine = findBlockEnd(lines, lineNum); 
+            sym.endLine = findBlockEnd(lines, lineNum);
             sym.filePath = filePath;
             sym.language = "cpp";
             symbols.append(sym);
@@ -144,11 +140,41 @@ QList<SymbolInfo> CodeParser::parseCpp(const QString &content, const QString &fi
     return symbols;
 }
 
-// اضافه کردن این تابع به CodeParser.cpp برای پشتیبانی از پایتون
-int CodeParser::findPythonBlockEnd(const QStringList &lines, int startLine) {
+int CodeParser::findBlockEnd(const QStringList &lines, int startLine)
+{
+    if (startLine <= 0 || startLine > lines.size())
+        return startLine;
+
+    int bracketCount = 0;
+    bool foundOpen = false;
+    bool inString = false;
+
+    for (int i = startLine - 1; i < lines.size(); ++i) {
+        QString line = lines[i];
+
+        for (int c = 0; c < line.length(); ++c) {
+            if (line[c] == '"' && (c == 0 || line[c-1] != '\\')) inString = !inString;
+            if (inString) continue;
+
+            if (line[c] == '{') {
+                bracketCount++;
+                foundOpen = true;
+            } else if (line[c] == '}') {
+                bracketCount--;
+            }
+        }
+
+        if (foundOpen && bracketCount <= 0) {
+            return i + 1;
+        }
+    }
+    return startLine;
+}
+
+int CodeParser::findPythonBlockEnd(const QStringList &lines, int startLine)
+{
     if (startLine <= 0 || startLine > lines.size()) return startLine;
 
-    // ۱. پیدا کردن میزان فاصله خط شروع (مثلاً ۴ تا Space)
     auto getIndent = [](const QString &line) {
         int indent = 0;
         for (QChar c : line) {
@@ -162,14 +188,11 @@ int CodeParser::findPythonBlockEnd(const QStringList &lines, int startLine) {
     int startIndent = getIndent(lines[startLine - 1]);
     int lastValidLine = startLine;
 
-    // ۲. حرکت به سمت پایین تا رسیدن به خطی با ایندنت کمتر یا مساوی
     for (int i = startLine; i < lines.size(); ++i) {
         QString line = lines[i];
-        if (line.trimmed().isEmpty()) continue; // نادیده گرفتن خطوط خالی
+        if (line.trimmed().isEmpty()) continue;
 
         int currentIndent = getIndent(line);
-        
-        // اگر به خطی رسیدیم که فاصله اش کمتر یا مساوی خط شروع بود، بلاک تمام شده
         if (currentIndent <= startIndent) {
             break;
         }
@@ -184,8 +207,7 @@ QList<SymbolInfo> CodeParser::parsePython(const QString &content, const QString 
     QStringList lines = content.split('\n');
 
     QRegularExpression classRe(R"(\bclass\s+([A-Za-z_][\w]*)(?:\s*\(([^)]*)\))?:)");
-    QRegularExpression funcRe(R"(^\s*def\s+([A-Za-z_][\w]*)\s*\(([^)]*)\)\s*(?:->\s*([\w\[\],\s]+))?\s*:)");
-    QRegularExpression importRe(R"((?:import|from)\s+([\w.]+))");
+    QRegularExpression funcRe(R"(^\s*def\s+([A-Za-z_][\w]*)\s*\(([^]*)\)\s*(?:->\s*([\w\[\],\s]+))?\s*:)");
 
     for (int i = 0; i < lines.size(); ++i) {
         const QString &line = lines.at(i);
@@ -198,7 +220,7 @@ QList<SymbolInfo> CodeParser::parsePython(const QString &content, const QString 
             sym.name = cm.captured(1).trimmed();
             sym.qualifiedName = sym.name;
             sym.startLine = lineNum;
-            sym.endLine = lineNum;
+            sym.endLine = findPythonBlockEnd(lines, lineNum);
             sym.filePath = filePath;
             sym.language = "python";
             symbols.append(sym);
@@ -214,7 +236,7 @@ QList<SymbolInfo> CodeParser::parsePython(const QString &content, const QString 
             if (fm.capturedLength() > 3)
                 sym.returnType = fm.captured(3).trimmed();
             sym.startLine = lineNum;
-            sym.endLine = lineNum;
+            sym.endLine = findPythonBlockEnd(lines, lineNum);
             sym.filePath = filePath;
             sym.language = "python";
             symbols.append(sym);
@@ -228,9 +250,7 @@ QList<SymbolInfo> CodeParser::parseJavaScript(const QString &content, const QStr
     QList<SymbolInfo> symbols;
     QStringList lines = content.split('\n');
 
-    QRegularExpression classRe(R"(\bclass\s+([A-Za-z_][\w]*))");
-    QRegularExpression funcRe(R"((?:function\s+(\w+)|const\s+(\w+)\s*=\s*(?:async\s*)?\()\s*\(([^)]*)\))");
-    QRegularExpression methodRe(R"(\b(\w+)\s*\(([^)]*)\)\s*\{)");
+    QRegularExpression classRe(R"(\bclass\s+([A-Za-z_][\w]*))" );
 
     for (int i = 0; i < lines.size(); ++i) {
         const QString &line = lines.at(i);
@@ -243,20 +263,7 @@ QList<SymbolInfo> CodeParser::parseJavaScript(const QString &content, const QStr
             sym.name = cm.captured(1).trimmed();
             sym.qualifiedName = sym.name;
             sym.startLine = lineNum;
-            sym.endLine = lineNum;
-            sym.filePath = filePath;
-            sym.language = "javascript";
-            symbols.append(sym);
-        }
-
-        auto fm = funcRe.match(line);
-        if (fm.hasMatch()) {
-            SymbolInfo sym;
-            sym.type = SymbolInfo::Function;
-            sym.name = fm.captured(1).isEmpty() ? fm.captured(2) : fm.captured(1);
-            sym.parameters = fm.captured(3).split(',', Qt::SkipEmptyParts);
-            sym.startLine = lineNum;
-            sym.endLine = lineNum;
+            sym.endLine = findBlockEnd(lines, lineNum);
             sym.filePath = filePath;
             sym.language = "javascript";
             symbols.append(sym);
@@ -275,8 +282,7 @@ QList<SymbolInfo> CodeParser::parseJava(const QString &content, const QString &f
     QList<SymbolInfo> symbols;
     QStringList lines = content.split('\n');
 
-    QRegularExpression classRe(R"(\b(?:public|private|protected)?\s*(?:final|abstract|sealed)?\s*class\s+([A-Za-z_][\w]*))");
-    QRegularExpression funcRe(R"((?:public|private|protected)?\s*(?:static)?\s*(?:final)?\s*([\w<>[\],\s]+)\s+(\w+)\s*\(([^)]*)\)\s*(?:throws\s+[\w,\s]+)?\s*\{)");
+    QRegularExpression classRe(R"(\b(?:public|private|protected)?\s*(?:final|abstract|sealed)?\s*class\s+([A-Za-z_][\w]*))" );
 
     for (int i = 0; i < lines.size(); ++i) {
         const QString &line = lines.at(i);
@@ -289,21 +295,7 @@ QList<SymbolInfo> CodeParser::parseJava(const QString &content, const QString &f
             sym.name = cm.captured(1).trimmed();
             sym.qualifiedName = sym.name;
             sym.startLine = lineNum;
-            sym.endLine = lineNum;
-            sym.filePath = filePath;
-            sym.language = "java";
-            symbols.append(sym);
-        }
-
-        auto fm = funcRe.match(line);
-        if (fm.hasMatch()) {
-            SymbolInfo sym;
-            sym.type = SymbolInfo::Method;
-            sym.returnType = fm.captured(1).simplified();
-            sym.name = fm.captured(2).trimmed();
-            sym.parameters = fm.captured(3).split(',', Qt::SkipEmptyParts);
-            sym.startLine = lineNum;
-            sym.endLine = lineNum;
+            sym.endLine = findBlockEnd(lines, lineNum);
             sym.filePath = filePath;
             sym.language = "java";
             symbols.append(sym);
@@ -322,10 +314,7 @@ QList<SymbolInfo> CodeParser::parseRust(const QString &content, const QString &f
     QList<SymbolInfo> symbols;
     QStringList lines = content.split('\n');
 
-    QRegularExpression structRe(R"(\bstruct\s+([A-Za-z_][\w]*))");
-    QRegularExpression fnRe(R"(\bfn\s+([A-Za-z_][\w]*)\s*\(([^)]*)\)\s*(?:->\s*([\w<>\[\],\s&]+))?\s*\{)");
-    QRegularExpression enumRe(R"(\benum\s+([A-Za-z_][\w]*))");
-    QRegularExpression modRe(R"(\bmod\s+([A-Za-z_][\w]*))");
+    QRegularExpression structRe(R"(\bstruct\s+([A-Za-z_][\w]*))" );
 
     for (int i = 0; i < lines.size(); ++i) {
         const QString &line = lines.at(i);
@@ -338,48 +327,7 @@ QList<SymbolInfo> CodeParser::parseRust(const QString &content, const QString &f
             sym.name = sm.captured(1).trimmed();
             sym.qualifiedName = sym.name;
             sym.startLine = lineNum;
-            sym.endLine = lineNum;
-            sym.filePath = filePath;
-            sym.language = "rust";
-            symbols.append(sym);
-        }
-
-        auto em = enumRe.match(line);
-        if (em.hasMatch()) {
-            SymbolInfo sym;
-            sym.type = SymbolInfo::Enum;
-            sym.name = em.captured(1).trimmed();
-            sym.qualifiedName = sym.name;
-            sym.startLine = lineNum;
-            sym.endLine = lineNum;
-            sym.filePath = filePath;
-            sym.language = "rust";
-            symbols.append(sym);
-        }
-
-        auto mm = modRe.match(line);
-        if (mm.hasMatch()) {
-            SymbolInfo sym;
-            sym.type = SymbolInfo::Namespace;
-            sym.name = mm.captured(1).trimmed();
-            sym.qualifiedName = sym.name;
-            sym.startLine = lineNum;
-            sym.endLine = lineNum;
-            sym.filePath = filePath;
-            sym.language = "rust";
-            symbols.append(sym);
-        }
-
-        auto fm = fnRe.match(line);
-        if (fm.hasMatch()) {
-            SymbolInfo sym;
-            sym.type = SymbolInfo::Function;
-            sym.name = fm.captured(1).trimmed();
-            sym.parameters = fm.captured(2).split(',', Qt::SkipEmptyParts);
-            if (fm.capturedLength() > 3)
-                sym.returnType = fm.captured(3).trimmed();
-            sym.startLine = lineNum;
-            sym.endLine = lineNum;
+            sym.endLine = findBlockEnd(lines, lineNum);
             sym.filePath = filePath;
             sym.language = "rust";
             symbols.append(sym);
@@ -393,39 +341,11 @@ QList<SymbolInfo> CodeParser::parseGo(const QString &content, const QString &fil
     QList<SymbolInfo> symbols;
     QStringList lines = content.split('\n');
 
-    QRegularExpression funcRe(R"(\bfunc\s+(?:\([^)]+\)\s+)?(\w+)\s*\(([^)]*)\)(?:\s*\([^)]*\))?(?:\s*[\w\[\],\s]+)?\s*\{)");
-    QRegularExpression typeRe(R"(\btype\s+([A-Za-z_][\w]*)\s+(?:struct|interface))");
-    QRegularExpression pkRe(R"(\bpackage\s+([\w]+))");
+    QRegularExpression funcRe(R"(\bfunc\s+(?:\([^)]+\)\s+)?(\w+)\s*\(([^]*)\))");
 
     for (int i = 0; i < lines.size(); ++i) {
         const QString &line = lines.at(i);
         int lineNum = i + 1;
-
-        auto pm = pkRe.match(line);
-        if (pm.hasMatch()) {
-            SymbolInfo sym;
-            sym.type = SymbolInfo::Namespace;
-            sym.name = pm.captured(1).trimmed();
-            sym.qualifiedName = sym.name;
-            sym.startLine = lineNum;
-            sym.endLine = lineNum;
-            sym.filePath = filePath;
-            sym.language = "go";
-            symbols.append(sym);
-        }
-
-        auto tm = typeRe.match(line);
-        if (tm.hasMatch()) {
-            SymbolInfo sym;
-            sym.type = SymbolInfo::Struct;
-            sym.name = tm.captured(1).trimmed();
-            sym.qualifiedName = sym.name;
-            sym.startLine = lineNum;
-            sym.endLine = lineNum;
-            sym.filePath = filePath;
-            sym.language = "go";
-            symbols.append(sym);
-        }
 
         auto fm = funcRe.match(line);
         if (fm.hasMatch()) {
@@ -434,7 +354,7 @@ QList<SymbolInfo> CodeParser::parseGo(const QString &content, const QString &fil
             sym.name = fm.captured(1).trimmed();
             sym.parameters = fm.captured(2).split(',', Qt::SkipEmptyParts);
             sym.startLine = lineNum;
-            sym.endLine = lineNum;
+            sym.endLine = findBlockEnd(lines, lineNum);
             sym.filePath = filePath;
             sym.language = "go";
             symbols.append(sym);
@@ -474,34 +394,4 @@ QList<QPair<int, int>> CodeParser::findBlocks(const QString &content, const QCha
         }
     }
     return blocks;
-}
-
-int CodeParser::findBlockEnd(const QStringList &lines, int startLine) {
-    int bracketCount = 0;
-    bool foundOpen = false;
-    bool inString = false;
-
-    // شروع جستجو از خطی که تابع/کلاس پیدا شده
-    for (int i = startLine - 1; i < lines.size(); ++i) {
-        QString line = lines[i];
-        
-        // نادیده گرفتن محتویات داخل کوتیشن برای اشتباه نشدن شمارش
-        for (int c = 0; c < line.length(); ++c) {
-            if (line[c] == '"' && (c == 0 || line[c-1] != '\\')) inString = !inString;
-            if (inString) continue;
-
-            if (line[c] == '{') {
-                bracketCount++;
-                foundOpen = true;
-            } else if (line[c] == '}') {
-                bracketCount--;
-            }
-        }
-
-        // اگه براکت باز شده بود و حالا شمارش به صفر رسید، یعنی پایان بلاک
-        if (foundOpen && bracketCount <= 0) {
-            return i + 1; // شماره خط پایان
-        }
-    }
-    return startLine; // اگه پایان پیدا نشد (خطای سینتکس در فایل اصلی)
 }
